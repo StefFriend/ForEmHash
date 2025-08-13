@@ -434,7 +434,7 @@ if GUI_AVAILABLE:
         
         def init_ui(self):
             """Initialize the user interface"""
-            self.setWindowTitle('eMule Forensics Hash Calculator')
+            self.setWindowTitle('ForEmHash v. 0.1')
             self.setGeometry(100, 100, 900, 600)
             
             # Central widget and main layout
