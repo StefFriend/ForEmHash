@@ -200,7 +200,7 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 ## 📜 License
 
-This project is licensed under the GNU License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
 
 ## ⚖️ Legal Notice
 
