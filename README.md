@@ -1,7 +1,7 @@
 # ForEmHash - Forensic eMule Hash Calculator
 
 [![Python](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![License](https://img.shields.io/badge/License-GNU%20GPLv3-green)
 [![Platform](https://img.shields.io/badge/platform-Windows%20|%20macOS%20|%20Linux-lightgrey.svg)](https://github.com/yourusername/foremhash)
 
 ForEmHash is a forensic tool designed to calculate eMule/ED2K hashes for digital evidence analysis. It computes ED2K, ICH (Intelligent Corruption Handling), and AICH (Advanced Intelligent Corruption Handling) hashes used by the eMule P2P network, making it invaluable for forensic investigations involving file sharing activities.
