@@ -134,6 +134,99 @@ exhibit,filename,filepath,size_bytes,size_mb,ed2k_hash,aich_hash,num_chunks,stat
 CASE001_HD1,document.pdf,/evidence/document.pdf,5242880,5.0,A1B2C3D4...,E5F6G7H8...,1,Success
 ```
 
+## 🔄 CSV Merger Tool (foremhash_merger.py)
+
+### Overview
+
+When processing multiple exhibits, you'll generate multiple CSV files with varying column counts (due to different file sizes and chunk counts). The **foremhash_merger.py** tool merges these CSVs and identifies unique files across all exhibits.
+
+### Key Features
+
+- **Handles Variable Columns**: Automatically manages CSV files with different numbers of columns
+- **Deduplication**: Identifies unique files based on ED2K hash
+- **Statistics Generation**: Provides comprehensive analysis of file distribution
+- **Cross-Exhibit Analysis**: Finds files that appear across multiple exhibits
+
+### Usage
+
+```bash
+# Merge all CSV files in current directory
+python foremhash_merger.py *.csv
+
+# Merge specific files
+python foremhash_merger.py exhibit1.csv exhibit2.csv exhibit3.csv
+
+# Specify output directory
+python foremhash_merger.py *.csv -o ./analysis_results
+```
+
+### Output Files
+
+The merger generates three files with automatic timestamps:
+
+1. **all_files_[timestamp].csv**
+   - Complete merged data including all duplicates
+   - All columns from all CSV files preserved
+   - Empty cells for missing chunk columns
+
+2. **unique_files_[timestamp].csv**
+   - Deduplicated file list (one entry per unique ED2K hash)
+   - If a file appears 10 times across exhibits, it's listed once
+   - Essential for identifying unique evidence
+
+3. **statistics_[timestamp].txt**
+   - Comprehensive statistics report including:
+     - Total files vs unique files
+     - Duplication percentages
+     - Size analysis (MB/GB)
+     - Files per exhibit breakdown
+     - Top 10 most duplicated files
+     - Potential storage savings
+
+### Example Statistics Report
+
+```
+========================================================================
+FOREMHASH CSV MERGE STATISTICS REPORT
+========================================================================
+Generated: 2024-12-19 15:30:45
+
+FILE COUNTS
+----------------------------------------
+Total files processed:     5,234
+Unique files (deduplicated): 2,156
+Duplicate instances:       3,078
+
+PERCENTAGES
+----------------------------------------
+Unique files:    41.23%
+Duplicate files: 58.77%
+
+SIZE ANALYSIS
+----------------------------------------
+Total size (all files):      125,432.50 MB (122.49 GB)
+Unique files size:           45,678.25 MB (44.61 GB)
+Duplicate data size:         79,754.25 MB (77.88 GB)
+Potential storage savings:   63.58% if deduplicated
+```
+
+### Complete Workflow Example
+
+```bash
+# Step 1: Process each exhibit separately
+python foremhash.py -e EXHIBIT_001 -i /evidence/device1 -o ./reports
+python foremhash.py -e EXHIBIT_002 -i /evidence/device2 -o ./reports
+python foremhash.py -e EXHIBIT_003 -i /evidence/device3 -o ./reports
+
+# Step 2: Merge all results and find unique files
+python foremhash_merger.py ./reports/*.csv -o ./final_analysis
+
+# Step 3: Review outputs
+# - Check unique_files_*.csv for files that exist nowhere else
+# - Review statistics_*.txt for overall analysis
+# - Use all_files_*.csv for complete documentation
+```
+
 ## 🔬 Technical Details
 
 ### ED2K Hash Algorithm
@@ -147,6 +240,14 @@ CASE001_HD1,document.pdf,/evidence/document.pdf,5242880,5.0,A1B2C3D4...,E5F6G7H8
 - Binary hash tree using SHA-1
 - Block size: 180 KB (184,320 bytes)
 - Used for advanced corruption recovery in eMule
+
+### Deduplication Logic
+
+Files are considered identical if they share the same ED2K hash, regardless of:
+- File name
+- File path
+- Exhibit location
+- Number of occurrences
 
 ## 🛠️ Verification
 
@@ -188,6 +289,13 @@ pip install PyQt5
 - Windows: Run as Administrator
 - Linux/Mac: Check file permissions with `ls -la`
 
+### CSV Merger Memory Issues
+
+For very large datasets (thousands of files):
+- Process CSV files in smaller batches
+- Increase Python memory allocation
+- Use a system with more RAM
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request. For major changes:
@@ -215,3 +323,13 @@ ForEmHash is designed for legitimate forensic analysis and law enforcement purpo
 | 10 GB | ~3 minutes | ~250 MB |
 
 *Performance varies based on hardware and storage type
+
+### CSV Merger Performance
+
+| Number of CSV Files | Total Records | Processing Time* | Memory Usage |
+|-------------------|---------------|-----------------|--------------|
+| 10 | ~5,000 | ~1 second | ~100 MB |
+| 50 | ~25,000 | ~5 seconds | ~300 MB |
+| 100 | ~50,000 | ~12 seconds | ~500 MB |
+
+*Performance varies based on file sizes and system specifications
