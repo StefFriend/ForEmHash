@@ -214,6 +214,20 @@ class eMuleHashCalculator:
         self.chunk_size = EMULE_CHUNK_SIZE
         self.aich_block_size = AICH_BLOCK_SIZE
     
+    def calculate_sha1_hash(self, filepath: str) -> str:
+        """
+        Calculate SHA1 hash of the entire file
+        """
+        sha1 = hashlib.sha1()
+        with open(filepath, 'rb') as f:
+            # Read file in chunks for memory efficiency
+            while True:
+                chunk = f.read(8192)  # Read 8KB at a time
+                if not chunk:
+                    break
+                sha1.update(chunk)
+        return sha1.hexdigest().upper()
+    
     def calculate_ed2k_hash(self, filepath: str) -> Dict:
         """
         Calculate ED2K hash according to eMule specification
@@ -315,6 +329,9 @@ class eMuleHashCalculator:
             # Calculate ED2K and chunk hashes
             ed2k_result = self.calculate_ed2k_hash(filepath)
             
+            # Calculate SHA1 hash of entire file
+            sha1_hash = self.calculate_sha1_hash(filepath)
+            
             # Calculate AICH hash
             aich_hash = self.calculate_aich_hash(filepath)
             
@@ -326,6 +343,7 @@ class eMuleHashCalculator:
                 'size_bytes': ed2k_result['file_size'],
                 'size_mb': round(ed2k_result['file_size'] / (1024 * 1024), 2),
                 'ed2k_hash': ed2k_result['ed2k_hash'],
+                'sha1_hash': sha1_hash,
                 'aich_hash': aich_hash,
                 'num_chunks': ed2k_result['num_chunks'],
                 'status': 'Success'
@@ -378,9 +396,9 @@ class eMuleHashCalculator:
         for result in results:
             all_keys.update(result.keys())
         
-        # Define column order
+        # Define column order - SHA1 hash comes right after ED2K hash
         primary_cols = ['exhibit', 'filename', 'filepath', 'size_bytes', 'size_mb', 
-                       'ed2k_hash', 'aich_hash', 'num_chunks', 'status']
+                       'ed2k_hash', 'sha1_hash', 'aich_hash', 'num_chunks', 'status']
         
         # Get chunk columns in order
         chunk_cols = sorted([k for k in all_keys if k.startswith('chunk_')])
@@ -584,8 +602,8 @@ if GUI_AVAILABLE:
             if not self.results:
                 return
             
-            # Setup table
-            display_cols = ['exhibit', 'filename', 'size_mb', 'ed2k_hash', 'aich_hash', 'status']
+            # Setup table - include SHA1 hash in display
+            display_cols = ['exhibit', 'filename', 'size_mb', 'ed2k_hash', 'sha1_hash', 'aich_hash', 'status']
             self.results_table.setColumnCount(len(display_cols))
             self.results_table.setHorizontalHeaderLabels(display_cols)
             self.results_table.setRowCount(len(self.results))
