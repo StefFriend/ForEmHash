@@ -1,8 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Known.met / Known2.met Analyzer for ForEmHash (AICH-fixed version)
-Gestisce correttamente i diversi formati AICH nei file known.met
+Known.met / Known2.met Analyzer for ForEmHash
 """
 
 import os
@@ -10,26 +7,65 @@ import sys
 import csv
 import struct
 import argparse
-import base64
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set, Optional, Any, DefaultDict
 
-# ----------------------------------------------------------------------------------------------------------------------
-# Parser known.met con gestione AICH migliorata
-# ----------------------------------------------------------------------------------------------------------------------
+# ------------------------------- Utilities -------------------------------
+
+def ts_to_iso(ts: Optional[int]) -> str:
+    """Convert unix epoch seconds to ISO8601 Z. Returns '' for 0/None."""
+    try:
+        if not ts:
+            return ""
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    except Exception:
+        return ""
+
+def fmt_bytes(n: int) -> str:
+    """Human-readable bytes (B, KB, MB, GB, TB, PB)."""
+    try:
+        n = int(n)
+    except Exception:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    i = 0
+    v = float(n)
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024.0
+        i += 1
+    if i == 0:
+        return f"{int(v)} {units[i]}"
+    return f"{v:.2f} {units[i]}"
+
+def bytes_to_mb_gb(n: int) -> str:
+    """Return string 'XX.XX MB (YY.YY GB)' with dot thousands and comma decimals."""
+    try:
+        n = int(n)
+    except Exception:
+        n = 0
+    mb = n / (1024.0 ** 2)
+    gb = n / (1024.0 ** 3)
+    return f"{mb:,.2f} MB ({gb:,.2f} GB)".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def to_int(x: Any) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return 0
+
+# ------------------------ known.met parser (extra fields) ------------------------
 
 class KnownMetParser:
     """
-    Parser robusto per eMule known.met / known2.met con gestione corretta AICH
+    Robust parser for eMule known.met / known2.met.
+    Extracts last_written (entry date), last_posted (max of Kad publish times), last_shared and bytes_uploaded.
     """
 
-    # Header attesi
     MET_HEADER          = 0x0E
     MET_HEADER_I64TAGS  = 0x0F
 
-    # Tipi di tag
     TAGTYPE_INVALID   = 0x00
     TAGTYPE_HASH16    = 0x01
     TAGTYPE_STRING    = 0x02
@@ -45,26 +81,25 @@ class KnownMetParser:
     TAGTYPE_STR1      = 0x11
     TAGTYPE_STR2      = 0x12
     TAGTYPE_STR3      = 0x13
-    TAGTYPE_STR16     = 0x12  # alias
 
-    # ID noti
+    # Known tag IDs
     FT_FILENAME = 'ID_01'
     FT_FILESIZE = 'ID_02'
-    FT_FILETYPE = 'ID_03'
-    FT_LASTSEEN = 'ID_05'
-    FT_TRANSFER = 'ID_08'
-    FT_SOURCES  = 'ID_15'
-    FT_AICH     = 'ID_27'  # AICH hash
-    FT_CPLSRC   = 'ID_30'
+    FT_LASTSHARED = 'ID_34'              # uint32
+    FT_KADLASTPUBLISHSRC   = 'ID_21'     # uint32
+    FT_KADLASTPUBLISHNOTES = 'ID_26'     # uint32
+    FT_ATTRANSFERRED_LO    = 'ID_50'     # uint32
+    FT_ATTRANSFERRED_HI    = 'ID_54'     # uint32
 
     def __init__(self, filepath: str, verbose: bool = False, max_tags_limit: int = 10000):
         self.filepath = filepath
         self.verbose = verbose
         self.max_tags_limit = max_tags_limit
         self.exhibit_name = self._extract_exhibit_name(filepath)
-        self.files: List[Dict] = []
+        self.files: List[Dict[str, Any]] = []
 
     def _extract_exhibit_name(self, filepath: str) -> str:
+        """Infer exhibit name from filename or parent directory."""
         filename = os.path.basename(filepath)
         low = filename.lower()
         if '_known.met' in low:
@@ -86,7 +121,7 @@ class KnownMetParser:
     def _read_exact(self, f, n: int, what: str = "data") -> bytes:
         data = f.read(n)
         if len(data) != n:
-            raise EOFError(f"Unexpected EOF at offset {self._tell(f)}")
+            raise EOFError(f"Unexpected EOF at offset {self._tell(f)} while reading {what}")
         return data
 
     def read_uint8(self, f):  return struct.unpack('<B', self._read_exact(f, 1, "uint8"))[0]
@@ -94,7 +129,6 @@ class KnownMetParser:
     def read_uint32(self, f): return struct.unpack('<I', self._read_exact(f, 4, "uint32"))[0]
     def read_uint64(self, f): return struct.unpack('<Q', self._read_exact(f, 8, "uint64"))[0]
     def read_hash16(self, f): return self._read_exact(f, 16, "HASH16")
-    def read_hash128_hex(self, f): return self._read_exact(f, 16, "MD4").hex().upper()
 
     def read_string(self, f, length=None, kind="STRING"):
         if length is None:
@@ -121,75 +155,12 @@ class KnownMetParser:
             raise EOFError(f"Unexpected EOF while reading BLOB")
         return self._read_exact(f, blen, "BLOB")
 
-    def _bytes_to_base32(self, data: bytes) -> str:
-        """Converte bytes in Base32 senza padding (formato eMule)"""
-        return base64.b32encode(data).decode('ascii').rstrip('=')
-
-    def _normalize_aich(self, tag_value, tag_type: int) -> str:
-        """
-        Normalizza l'AICH in Base32 indipendentemente dal formato di storage
-        
-        eMule può salvare AICH come:
-        - STRING (Base32)
-        - HASH16 (20 bytes SHA1 binario) 
-        - BLOB (20 bytes SHA1 binario)
-        """
-        if tag_type == self.TAGTYPE_STRING:
-            # Già in Base32
-            if isinstance(tag_value, str):
-                # Rimuovi eventuali padding e normalizza
-                return tag_value.upper().rstrip('=')
-            else:
-                return str(tag_value).upper().rstrip('=')
-                
-        elif tag_type == self.TAGTYPE_HASH16:
-            # 16 bytes binari (ma AICH è SHA1 quindi 20 bytes - possibile troncamento)
-            if isinstance(tag_value, str):
-                # È già hex, convertiamo in bytes poi Base32
-                try:
-                    data = bytes.fromhex(tag_value)
-                    return self._bytes_to_base32(data)
-                except:
-                    return tag_value
-            elif isinstance(tag_value, bytes):
-                return self._bytes_to_base32(tag_value)
-                
-        elif tag_type == self.TAGTYPE_BLOB or tag_type == self.TAGTYPE_BSOB:
-            # SHA1 binario (20 bytes)
-            if isinstance(tag_value, bytes) and len(tag_value) == 20:
-                return self._bytes_to_base32(tag_value)
-            elif isinstance(tag_value, bytes):
-                # Potrebbe essere già Base32 encoded come bytes
-                try:
-                    decoded_str = tag_value.decode('ascii')
-                    # Verifica se sembra Base32
-                    if all(c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567=' for c in decoded_str.upper()):
-                        return decoded_str.upper().rstrip('=')
-                    else:
-                        # Non è Base32, assumiamo sia binario
-                        return self._bytes_to_base32(tag_value)
-                except:
-                    return self._bytes_to_base32(tag_value)
-        
-        # Fallback: prova a convertire comunque
-        if isinstance(tag_value, bytes):
-            if len(tag_value) == 20:  # SHA1 binary
-                return self._bytes_to_base32(tag_value)
-            else:
-                try:
-                    # Potrebbe essere Base32 come bytes
-                    return tag_value.decode('ascii').upper().rstrip('=')
-                except:
-                    return tag_value.hex().upper()
-        else:
-            return str(tag_value).upper().rstrip('=')
-
     def read_tag(self, f):
+        """Read a tag with flexible name encoding and multiple value types."""
         start_off = self._tell(f)
         tag_type = self.read_uint8(f)
-        original_tag_type = tag_type  # Salviamo il tipo originale
 
-        # Nome / ID
+        # Name/ID
         if tag_type & 0x80:
             tag_type &= 0x7F
             tag_name = f"ID_{self.read_uint8(f):02X}"
@@ -200,7 +171,7 @@ class KnownMetParser:
             else:
                 tag_name = self.read_string(f, name_len, kind="TAGNAME")
 
-        # Valore
+        # Value
         tag_value = None
         if tag_type == self.TAGTYPE_INVALID:
             return tag_name, None, tag_type
@@ -236,19 +207,20 @@ class KnownMetParser:
         elif tag_type == self.TAGTYPE_BSOB:
             tag_value = self.read_bsob(f)
         else:
-            # Tipo sconosciuto
+            # Skip unknown tag types by trying BSOB/BLOB heuristics
             try:
                 _ = self.read_bsob(f)
             except:
                 try:
                     _ = self.read_blob(f)
                 except:
-                    raise ValueError(f"Unsupported tag type 0x{tag_type:X}")
+                    raise ValueError(f"Unsupported tag type 0x{tag_type:X} at {start_off}")
             return tag_name, None, tag_type
 
         return tag_name, tag_value, tag_type
 
     def _peek_tag_count_plausible(self, f) -> Optional[int]:
+        """Heuristic to check if next 4 bytes plausibly represent a tag count."""
         pos = self._tell(f)
         if self._remaining(f) < 4:
             return None
@@ -260,8 +232,9 @@ class KnownMetParser:
         f.seek(pos, os.SEEK_SET)
         return None
 
-    def _try_hashset_schema(self, f, schema: int):
-        start = self._tell(f)
+    def _try_hashset_schema(self, f, schema: int) -> str:
+        """Try multiple known MD4-hashset layouts and return ED2K (hex)."""
+        entry_pos = self._tell(f)
         if schema == 1:
             filehash = self.read_hash16(f).hex().upper()
             part_cnt = self.read_uint16(f)
@@ -299,6 +272,7 @@ class KnownMetParser:
             raise ValueError("unknown schema")
 
     def _parse_hashset_flexible(self, f) -> str:
+        """Attempt all MD4-hashset schemas until one fits; return ED2K (hex)."""
         entry_pos = self._tell(f)
         last_err = None
         for schema in (1, 2, 3, 4):
@@ -310,6 +284,7 @@ class KnownMetParser:
         raise ValueError(f"Failed to parse MD4 hashset at {entry_pos}: {last_err}")
 
     def parse(self) -> bool:
+        """Parse known.met/known2.met file and populate self.files entries."""
         any_ok = False
         try:
             with open(self.filepath, 'rb') as f:
@@ -324,45 +299,59 @@ class KnownMetParser:
 
                 for idx in range(num_files):
                     entry_start = self._tell(f)
-                    file_entry = {
+                    file_entry: Dict[str, Any] = {
                         'exhibit': self.exhibit_name,
                         'source_file': os.path.basename(self.filepath)
                     }
                     try:
-                        # 1) data (DWORD)
-                        file_entry['entry_date_raw'] = self.read_uint32(f)
+                        # 1) last_written (DWORD UTC)
+                        entry_date_raw = self.read_uint32(f)
+                        file_entry['last_written'] = ts_to_iso(entry_date_raw)
+                        file_entry['entry_date_raw'] = entry_date_raw
 
-                        # 2) MD4 hashset
+                        # 2) Flexible MD4 hashset -> ED2K hex
                         file_entry['ed2k_hash'] = self._parse_hashset_flexible(f)
 
-                        # 3) numero tag
+                        # 3) number of tags
                         num_tags = self.read_uint32(f)
                         if num_tags > self.max_tags_limit:
                             raise ValueError(f"num_tags implausible: {num_tags}")
 
-                        # 4) tag
+                        # Temporary holders for bytes_uploaded and last_posted
+                        bytes_lo, bytes_hi = None, None
+                        kad_src, kad_notes = None, None
+
+                        # 4) tags
                         for _ in range(num_tags):
                             tag_name, tag_value, tag_type = self.read_tag(f)
                             if not tag_name:
                                 continue
-                            
+
                             if tag_name == self.FT_FILENAME and isinstance(tag_value, str):
                                 file_entry['filename'] = tag_value
                             elif tag_name == self.FT_FILESIZE:
                                 file_entry['filesize'] = tag_value
-                            elif tag_name == self.FT_AICH:
-                                # Normalizza AICH in Base32
-                                file_entry['aich_hash'] = self._normalize_aich(tag_value, tag_type)
-                                if self.verbose:
-                                    print(f"  AICH found (type={tag_type}): {file_entry['aich_hash'][:16]}...")
-                            elif tag_name == self.FT_LASTSEEN:
-                                file_entry['last_seen'] = tag_value
-                            elif tag_name == self.FT_TRANSFER:
-                                file_entry['transferred'] = tag_value
-                            elif tag_name == self.FT_SOURCES:
-                                file_entry['sources'] = tag_value
-                            elif tag_name == self.FT_CPLSRC:
-                                file_entry['complete_sources'] = tag_value
+                            elif tag_name == self.FT_LASTSHARED:
+                                file_entry['last_shared'] = ts_to_iso(tag_value)
+                            elif tag_name == self.FT_KADLASTPUBLISHSRC:
+                                kad_src = int(tag_value)
+                            elif tag_name == self.FT_KADLASTPUBLISHNOTES:
+                                kad_notes = int(tag_value)
+                            elif tag_name == self.FT_ATTRANSFERRED_LO:
+                                bytes_lo = int(tag_value)
+                            elif tag_name == self.FT_ATTRANSFERRED_HI:
+                                bytes_hi = int(tag_value)
+
+                        # last_posted = max(kad_src, kad_notes)
+                        if kad_src or kad_notes:
+                            last_post = max(kad_src or 0, kad_notes or 0)
+                            file_entry['last_posted'] = ts_to_iso(last_post)
+
+                        # bytes_uploaded 64-bit
+                        if bytes_lo is not None or bytes_hi is not None:
+                            lo = bytes_lo or 0
+                            hi = bytes_hi or 0
+                            file_entry['bytes_uploaded'] = (hi << 32) | lo
 
                         self.files.append(file_entry)
                         any_ok = True
@@ -380,21 +369,22 @@ class KnownMetParser:
     def get_hashes(self) -> Set[str]:
         return {f['ed2k_hash'] for f in self.files if 'ed2k_hash' in f}
 
-
-# ----------------------------------------------------------------------------------------------------------------------
-# Analyzer con comparazione AICH migliorata
-# ----------------------------------------------------------------------------------------------------------------------
+# -------------------- Analyzer with intra/inter CSV dedup & stats --------------------
 
 class KnownMetAnalyzer:
-    """Match tra CSV (ForEmHash) e known.met/known2.met con gestione AICH corretta"""
+    """Match CSV (ForEmHash) with known.met, compute dedup stats, and export summary."""
 
     def __init__(self):
-        self.csv_data: List[Dict] = []
-        self.known_met_data: List[Dict] = []
-        self.matches: List[Dict] = []
-        self.statistics: Dict = {}
+        self.csv_data: List[Dict[str, Any]] = []
+        self.known_met_data: List[Dict[str, Any]] = []
+        self.matches: List[Dict[str, Any]] = []
+        self.statistics: Dict[str, Any] = {}
+        self.csv_exhibits_by_ed2k: DefaultDict[str, Set[str]] = defaultdict(set)
+        self.csv_unique_by_file: DefaultDict[str, Set[str]] = defaultdict(set)
+        self.ed2k_to_csvfiles: DefaultDict[str, Set[str]] = defaultdict(set)
 
     def load_csv_files(self, csv_dir: str) -> int:
+        """Load all CSVs, normalize ED2K, and collect per-file unique sets."""
         csv_files = list(Path(csv_dir).glob('*.csv'))
         for csv_file in csv_files:
             print(f"Loading CSV: {csv_file.name}")
@@ -402,19 +392,33 @@ class KnownMetAnalyzer:
                 with open(csv_file, 'r', encoding='utf-8') as f:
                     reader = csv.DictReader(f)
                     for row in reader:
+                        row = dict(row)
                         row['source_csv'] = csv_file.name
-                        # Normalizza AICH dal CSV se presente
-                        if 'aich_hash' in row and row['aich_hash']:
-                            # Rimuovi padding e converti in maiuscolo
-                            row['aich_hash'] = row['aich_hash'].upper().rstrip('=')
+
+                        # Normalize ED2K
+                        if 'ed2k_hash' not in row and 'ed2k' in row:
+                            row['ed2k_hash'] = (row.get('ed2k') or '').upper()
+                        if 'ed2k_hash' in row and row['ed2k_hash']:
+                            row['ed2k_hash'] = row['ed2k_hash'].upper()
+
+                        ed2k = row.get('ed2k_hash', '').strip()
+                        exhibit = (row.get('exhibit') or row.get('Exhibit') or '').strip()
+
+                        if ed2k:
+                            self.csv_unique_by_file[csv_file.name].add(ed2k)
+                            self.ed2k_to_csvfiles[ed2k].add(csv_file.name)
+                        if ed2k and exhibit:
+                            self.csv_exhibits_by_ed2k[ed2k].add(exhibit)
+
                         self.csv_data.append(row)
             except Exception as e:
                 print(f"Error reading {csv_file}: {e}")
         return len(self.csv_data)
 
     def load_known_met_files(self, known_dir: str, verbose: bool = False) -> int:
+        """Parse all *known.met / *known2.met files in the directory."""
         patterns = ['*known.met', '*known2.met']
-        known_files = []
+        known_files: List[Path] = []
         for p in patterns:
             known_files.extend(Path(known_dir).glob(p))
 
@@ -429,101 +433,268 @@ class KnownMetAnalyzer:
         return len(self.known_met_data)
 
     def analyze_matches(self):
-        # Indicizza per ED2K
-        known_hashes = defaultdict(list)
-        for known_file in self.known_met_data:
-            if 'ed2k_hash' in known_file:
-                known_hashes[known_file['ed2k_hash']].append(known_file)
+        """Build matches by ED2K and compute all aggregate statistics."""
+        # Index known entries by ED2K
+        known_by_ed2k: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for known_entry in self.known_met_data:
+            ed2k = known_entry.get('ed2k_hash')
+            if ed2k:
+                known_by_ed2k[ed2k].append(known_entry)
 
-        matched_csv_files = []
-        unmatched_csv_files = []
-        aich_matches = 0
-        aich_mismatches = 0
+        matched_csv_files: List[Dict[str, Any]] = []
+        unmatched_csv_files: List[Dict[str, Any]] = []
 
+        # Create match rows (rep aggregates are joined with "-")
         for csv_row in self.csv_data:
-            ed2k = csv_row.get('ed2k_hash') or csv_row.get('ed2k') or ''
-            if ed2k and ed2k in known_hashes:
-                for known_entry in known_hashes[ed2k]:
-                    # Verifica match AICH
-                    aich_csv = csv_row.get('aich_hash', '').upper().rstrip('=')
-                    aich_known = known_entry.get('aich_hash', '').upper().rstrip('=')
-                    
-                    aich_match_status = 'N/A'
-                    if aich_csv and aich_known:
-                        if aich_csv == aich_known:
-                            aich_match_status = 'MATCH'
-                            aich_matches += 1
-                        else:
-                            aich_match_status = 'MISMATCH'
-                            aich_mismatches += 1
-                    
+            ed2k = (csv_row.get('ed2k_hash') or '').strip()
+            if ed2k and ed2k in known_by_ed2k:
+                exhibits_for_hash = sorted(self.csv_exhibits_by_ed2k.get(ed2k, set()))
+                exhibit_agg = "-".join(exhibits_for_hash) if exhibits_for_hash else (csv_row.get('exhibit') or csv_row.get('Exhibit') or "")
+
+                for known_entry in known_by_ed2k[ed2k]:
                     match = {
                         'ed2k_hash': ed2k,
                         'filename_csv': csv_row.get('filename', ''),
                         'filename_known': known_entry.get('filename', ''),
                         'filesize': csv_row.get('size_bytes', csv_row.get('filesize', '')),
-                        'exhibit_csv': csv_row.get('exhibit', ''),
+                        'exhibit_csv': exhibit_agg,               # rep1-rep2-...
                         'exhibit_known': known_entry.get('exhibit', ''),
                         'source_csv': csv_row.get('source_csv', ''),
                         'source_known': known_entry.get('source_file', ''),
-                        'sha1_hash': csv_row.get('sha1_hash', ''),
-                        'aich_hash_csv': aich_csv,
-                        'aich_hash_known': aich_known,
-                        'aich_match': aich_match_status,
-                        'last_seen': known_entry.get('last_seen', ''),
-                        'sources': known_entry.get('sources', ''),
-                        'complete_sources': known_entry.get('complete_sources', '')
+                        'last_written': known_entry.get('last_written', ''),
+                        'last_posted': known_entry.get('last_posted', ''),
+                        'last_shared': known_entry.get('last_shared', ''),
+                        'bytes_uploaded': known_entry.get('bytes_uploaded', ''),
                     }
                     self.matches.append(match)
                 matched_csv_files.append(csv_row)
             else:
                 unmatched_csv_files.append(csv_row)
 
+        # ---- Core counts ----
+        total_csv_rows = len(self.csv_data)
+        total_known_rows = len(self.known_met_data)
+        matched_rows = len(matched_csv_files)
+        unmatched_rows = len(unmatched_csv_files)
+
+        # Global unique ED2K in CSVs
+        csv_unique_global: Set[str] = set()
+        for s in self.csv_unique_by_file.values():
+            csv_unique_global |= s
+        total_csv_unique = len(csv_unique_global)
+
+        # Unique ED2K in known.met
+        known_unique_global: Set[str] = {e['ed2k_hash'] for e in self.known_met_data if e.get('ed2k_hash')}
+        total_known_unique = len(known_unique_global)
+
+        # Unique matched ED2K
+        matched_unique: Set[str] = {m['ed2k_hash'] for m in self.matches}
+        total_matched_unique = len(matched_unique)
+
+        # Match percentages
+        pct_rows_matched = (matched_rows / total_csv_rows * 100) if total_csv_rows else 0.0
+        pct_rows_unmatched = 100.0 - pct_rows_matched if total_csv_rows else 0.0
+        pct_unique_matched = (total_matched_unique / total_csv_unique * 100) if total_csv_unique else 0.0
+        pct_unique_unmatched = 100.0 - pct_unique_matched if total_csv_unique else 0.0
+
+        # Intra-CSV dedup stats (per file)
+        intra_csv_stats: List[Dict[str, Any]] = []
+        for csv_name, unique_set in sorted(self.csv_unique_by_file.items()):
+            rows_in_file = sum(1 for r in self.csv_data if r.get('source_csv') == csv_name)
+            unique_count = len(unique_set)
+            dup_count = rows_in_file - unique_count
+            pct_dup = (dup_count / rows_in_file * 100) if rows_in_file else 0.0
+            pct_unique = (unique_count / rows_in_file * 100) if rows_in_file else 0.0
+            intra_csv_stats.append({
+                'csv': csv_name,
+                'rows': rows_in_file,
+                'unique_ed2k': unique_count,
+                'unique_rows_pct': pct_unique,       # will be printed after DupRows
+                'duplicate_rows': dup_count,
+                'duplicate_rows_pct': pct_dup
+            })
+
+        # Inter-CSV dedup (global)
+        dup_global = total_csv_rows - total_csv_unique
+        pct_dup_global = (dup_global / total_csv_rows * 100) if total_csv_rows else 0.0
+
+        # Unique ED2K that appear in >= 2 different CSV files (cross-file overlap)
+        overlap_multi_csv = sum(1 for ed2k, files in self.ed2k_to_csvfiles.items() if len(files) > 1)
+        pct_overlap_multi_csv = (overlap_multi_csv / total_csv_unique * 100) if total_csv_unique else 0.0
+
+        # Per-exhibit (matched): count unique matched ED2K per exhibit (from CSV)
+        per_exhibit_counts: DefaultDict[str, int] = defaultdict(int)
+        matched_set = { (r.get('source_csv'), (r.get('ed2k_hash') or '').strip(), (r.get('exhibit') or r.get('Exhibit') or '').strip())
+                        for r in self.csv_data if (r.get('ed2k_hash') or '') in matched_unique }
+        for _src, _ed2k, ex in matched_set:
+            if ex:
+                per_exhibit_counts[ex] += 1
+
+        # Per known.met source file (on matches)
+        per_known_source: DefaultDict[str, int] = defaultdict(int)
+        for m in self.matches:
+            src = m.get('source_known', '')
+            if src:
+                per_known_source[src] += 1
+
+        # Top 10 most common matched ED2K (FULL hash)
+        hash_counts: Dict[str, int] = defaultdict(int)
+        for m in self.matches:
+            hash_counts[m['ed2k_hash']] += 1
+        top10 = sorted(hash_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        top10_list = [{'hash': h, 'count': c,
+                       'filename': next((mm['filename_csv'] for mm in self.matches if mm['ed2k_hash'] == h and mm.get('filename_csv')), 'Unknown')}
+                      for h, c in top10]
+
+        # Bytes uploaded (raw and unique on matches)
+        unique_matches: Dict[str, Dict[str, Any]] = {}
+        for m in self.matches:
+            unique_matches.setdefault(m['ed2k_hash'], m)
+
+        bytes_total_matches = sum(to_int(m.get('bytes_uploaded', 0)) for m in self.matches)
+        bytes_total_unique  = sum(to_int(m.get('bytes_uploaded', 0)) for m in unique_matches.values())
+
+        # Temporal breakdown on unique matches
+        def _year(s: str) -> Optional[str]:
+            return s[:4] if isinstance(s, str) and len(s) >= 4 else None
+        def _ym(s: str) -> Optional[str]:
+            return s[:7] if isinstance(s, str) and len(s) >= 7 else None
+
+        ls_year_count: DefaultDict[str, int] = defaultdict(int)
+        ls_ym_count: DefaultDict[str, int] = defaultdict(int)
+        lp_year_count: DefaultDict[str, int] = defaultdict(int)
+        lp_ym_count: DefaultDict[str, int] = defaultdict(int)
+
+        ls_year_bytes: DefaultDict[str, int] = defaultdict(int)
+        ls_ym_bytes: DefaultDict[str, int] = defaultdict(int)
+        lp_year_bytes: DefaultDict[str, int] = defaultdict(int)
+        lp_ym_bytes: DefaultDict[str, int] = defaultdict(int)
+
+        for um in unique_matches.values():
+            bu = to_int(um.get('bytes_uploaded', 0))
+
+            ls = um.get('last_shared') or ""
+            y = _year(ls)
+            if y:
+                ls_year_count[y] += 1
+                ls_year_bytes[y] += bu
+            ym = _ym(ls)
+            if ym:
+                ls_ym_count[ym] += 1
+                ls_ym_bytes[ym] += bu
+
+            lp = um.get('last_posted') or ""
+            y2 = _year(lp)
+            if y2:
+                lp_year_count[y2] += 1
+                lp_year_bytes[y2] += bu
+            ym2 = _ym(lp)
+            if ym2:
+                lp_ym_count[ym2] += 1
+                lp_ym_bytes[ym2] += bu
+
+        # ---------------- CSV-only stats (size & counts) ----------------
+        total_size_bytes_all_rows = 0
+        unique_size_map: Dict[str, int] = {}  # ed2k -> representative size (max seen)
+        per_exhibit_csv_rows: DefaultDict[str, int] = defaultdict(int)
+        per_exhibit_csv_unique: DefaultDict[str, Set[str]] = defaultdict(set)
+
+        for row in self.csv_data:
+            ex = (row.get('exhibit') or row.get('Exhibit') or '').strip()
+            ed = (row.get('ed2k_hash') or '').strip()
+            size = to_int(row.get('size_bytes') or row.get('filesize') or 0)
+
+            total_size_bytes_all_rows += size
+            if ed and (ed not in unique_size_map or size > unique_size_map[ed]):
+                unique_size_map[ed] = size
+
+            if ex:
+                per_exhibit_csv_rows[ex] += 1
+                if ed:
+                    per_exhibit_csv_unique[ex].add(ed)
+
+        total_size_bytes_unique = sum(unique_size_map.values())
+        duplicate_size_bytes = max(0, total_size_bytes_all_rows - total_size_bytes_unique)
+        potential_savings_pct = (duplicate_size_bytes / total_size_bytes_all_rows * 100) if total_size_bytes_all_rows else 0.0
+
+        # CSV unique/duplicate counts
+        csv_dup_instances = max(0, total_csv_rows - total_csv_unique)
+        csv_pct_unique = (total_csv_unique / total_csv_rows * 100) if total_csv_rows else 0.0
+        csv_pct_dup = 100.0 - csv_pct_unique if total_csv_rows else 0.0
+
+        # Per-exhibit CSV (rows and unique ED2K)
+        per_exhibit_csv_unique_counts = {ex: len(s) for ex, s in per_exhibit_csv_unique.items()}
+
         self.statistics = {
-            'total_csv_files': len(self.csv_data),
-            'total_known_files': len(self.known_met_data),
-            'matched_files': len(matched_csv_files),
-            'unmatched_files': len(unmatched_csv_files),
-            'unique_matched_hashes': len(set(m['ed2k_hash'] for m in self.matches)),
-            'match_percentage': (len(matched_csv_files) / len(self.csv_data) * 100) if self.csv_data else 0,
-            'aich_matches': aich_matches,
-            'aich_mismatches': aich_mismatches
+            'total_csv_rows': total_csv_rows,
+            'total_known_rows': total_known_rows,
+            'matched_rows': matched_rows,
+            'unmatched_rows': unmatched_rows,
+            'pct_rows_matched': pct_rows_matched,
+            'pct_rows_unmatched': pct_rows_unmatched,
+
+            'total_csv_unique': total_csv_unique,
+            'total_known_unique': total_known_unique,
+            'matched_unique': total_matched_unique,
+            'unmatched_unique': total_csv_unique - total_matched_unique,
+            'pct_unique_matched': pct_unique_matched,
+            'pct_unique_unmatched': pct_unique_unmatched,
+
+            'intra_csv_stats': intra_csv_stats,
+            'dup_global_rows': dup_global,
+            'pct_dup_global_rows': pct_dup_global,
+
+            'overlap_multi_csv_unique': overlap_multi_csv,
+            'pct_overlap_multi_csv_unique': pct_overlap_multi_csv,
+
+            'per_exhibit_counts': dict(sorted(per_exhibit_counts.items())),
+            'per_known_source': dict(sorted(per_known_source.items())),
+            'top10': top10_list,
+
+            'bytes_uploaded_total_matches': bytes_total_matches,
+            'bytes_uploaded_total_unique': bytes_total_unique,
+
+            'last_shared_by_year_count': dict(sorted(ls_year_count.items())),
+            'last_shared_by_month_count': dict(sorted(ls_ym_count.items())),
+            'last_posted_by_year_count': dict(sorted(lp_year_count.items())),
+            'last_posted_by_month_count': dict(sorted(lp_ym_count.items())),
+
+            'last_shared_by_year_bytes': {k: ls_year_bytes[k] for k in sorted(ls_year_bytes)},
+            'last_shared_by_month_bytes': {k: ls_ym_bytes[k] for k in sorted(ls_ym_bytes)},
+            'last_posted_by_year_bytes': {k: lp_year_bytes[k] for k in sorted(lp_year_bytes)},
+            'last_posted_by_month_bytes': {k: lp_ym_bytes[k] for k in sorted(lp_ym_bytes)},
+
+            # CSV-only
+            'csv_file_counts_total': total_csv_rows,
+            'csv_file_counts_unique': total_csv_unique,
+            'csv_file_counts_duplicates': csv_dup_instances,
+            'csv_pct_unique': csv_pct_unique,
+            'csv_pct_duplicates': csv_pct_dup,
+
+            'csv_total_size_bytes_all_rows': total_size_bytes_all_rows,
+            'csv_total_size_bytes_unique': total_size_bytes_unique,
+            'csv_duplicate_size_bytes': duplicate_size_bytes,
+            'csv_potential_savings_pct': potential_savings_pct,
+
+            'csv_files_per_exhibit_rows': dict(sorted(per_exhibit_csv_rows.items())),
+            'csv_files_per_exhibit_unique': dict(sorted(per_exhibit_csv_unique_counts.items())),
         }
 
-        # Cross-exhibit
-        hash_exhibits = defaultdict(set)
-        for match in self.matches:
-            if match['exhibit_csv']:
-                hash_exhibits[match['ed2k_hash']].add(match['exhibit_csv'])
-            if match['exhibit_known']:
-                hash_exhibits[match['ed2k_hash']].add(match['exhibit_known'])
-        self.statistics['cross_exhibit_matches'] = sum(1 for ex in hash_exhibits.values() if len(ex) > 2)
-
-        # Top 10
-        hash_counts = defaultdict(int)
-        for match in self.matches:
-            hash_counts[match['ed2k_hash']] += 1
-        if hash_counts:
-            most_common = sorted(hash_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-            self.statistics['most_common_files'] = [
-                {
-                    'hash': h,
-                    'count': c,
-                    'filename': next((m['filename_csv'] for m in self.matches if m['ed2k_hash'] == h), 'Unknown')
-                }
-                for h, c in most_common
-            ]
+        # Cache unique matches for export
+        self._unique_matches_cache = unique_matches
 
     def export_results(self, output_dir: str):
+        """Export matches CSV, unique matches CSV, and the summary TXT."""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         os.makedirs(output_dir, exist_ok=True)
 
-        # CSV dei match (con colonna aich_match)
+        # Matches CSV
         matched_csv = os.path.join(output_dir, f'known_met_matches_{timestamp}.csv')
-        fieldnames = ['ed2k_hash', 'sha1_hash', 'filename_csv', 'filename_known',
-                      'filesize', 'exhibit_csv', 'exhibit_known', 'source_csv',
-                      'source_known', 'aich_hash_csv', 'aich_hash_known', 'aich_match',
-                      'last_seen', 'sources', 'complete_sources']
+        fieldnames = [
+            'ed2k_hash', 'filename_csv', 'filename_known', 'filesize',
+            'exhibit_csv', 'exhibit_known', 'source_csv', 'source_known',
+            'last_written', 'last_posted', 'last_shared', 'bytes_uploaded'
+        ]
         if self.matches:
             with open(matched_csv, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -531,10 +702,8 @@ class KnownMetAnalyzer:
                 writer.writerows(self.matches)
             print(f"Exported matches: {matched_csv}")
 
-        # CSV deduplicato
-        unique_matches = {}
-        for m in self.matches:
-            unique_matches.setdefault(m['ed2k_hash'], m)
+        # Unique matches CSV (one per ED2K)
+        unique_matches = getattr(self, '_unique_matches_cache', {})
         dedup_csv = os.path.join(output_dir, f'known_met_unique_{timestamp}.csv')
         if unique_matches:
             with open(dedup_csv, 'w', newline='', encoding='utf-8') as f:
@@ -543,91 +712,203 @@ class KnownMetAnalyzer:
                 writer.writerows(unique_matches.values())
             print(f"Exported unique files: {dedup_csv}")
 
-        # Statistiche TXT
-        stats_file = os.path.join(output_dir, f'known_met_statistics_{timestamp}.txt')
+        # Summary TXT
+        stats_file = os.path.join(output_dir, f'known_met_summary_{timestamp}.txt')
+        s = self.statistics
+
+        def line(txt=""): return txt + "\n"
+
+        def fmt_map_count(d: Dict[str, int], key_title: str, val_title: str = "Count") -> str:
+            out = ""
+            if d:
+                key_w = max(len(key_title), *(len(k) for k in d.keys())) if d else len(key_title)
+                out += f"{key_title:<{key_w}}  {val_title:>12}\n"
+                for k, v in d.items():
+                    out += f"{k:<{key_w}}  {v:12d}\n"
+            return out
+
+        def fmt_map_bytes(d: Dict[str, int], key_title: str) -> str:
+            out = ""
+            if d:
+                key_w = max(len(key_title), *(len(k) for k in d.keys())) if d else len(key_title)
+                out += f"{key_title:<{key_w}}  {'Bytes':>18}  {'Human':>18}\n"
+                for k, v in d.items():
+                    out += f"{k:<{key_w}}  {v:18,d}  {fmt_bytes(v):>18}\n"
+            return out
+
         with open(stats_file, 'w', encoding='utf-8') as f:
             f.write("=" * 80 + "\n")
-            f.write("KNOWN.MET ANALYSIS REPORT\n")
+            f.write("KNOWN.MET ANALYSIS SUMMARY\n")
             f.write("=" * 80 + "\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
+            # OVERVIEW
             f.write("OVERVIEW\n")
             f.write("-" * 40 + "\n")
-            f.write(f"Total files in CSV inputs:     {self.statistics.get('total_csv_files', 0):,}\n")
-            f.write(f"Total files in known.met:      {self.statistics.get('total_known_files', 0):,}\n")
-            f.write(f"Matched files:                 {self.statistics.get('matched_files', 0):,}\n")
-            f.write(f"Unmatched files:               {self.statistics.get('unmatched_files', 0):,}\n")
-            f.write(f"Match percentage:              {self.statistics.get('match_percentage', 0):.2f}%\n")
-            f.write(f"Unique matched hashes:         {self.statistics.get('unique_matched_hashes', 0):,}\n")
-            f.write(f"AICH matches:                  {self.statistics.get('aich_matches', 0):,}\n")
-            f.write(f"AICH mismatches:               {self.statistics.get('aich_mismatches', 0):,}\n")
-            f.write(f"Cross-exhibit matches:         {self.statistics.get('cross_exhibit_matches', 0):,}\n\n")
+            f.write(line(f"Total CSV rows:                {s.get('total_csv_rows', 0):,}"))
+            f.write(line(f"Total known.met rows:          {s.get('total_known_rows', 0):,}"))
+            f.write(line(f"Total CSV unique ED2K:         {s.get('total_csv_unique', 0):,}"))
+            f.write(line(f"Total known.met unique ED2K:   {s.get('total_known_unique', 0):,}"))
+            f.write("\n")
 
-            # Se ci sono AICH mismatch, avvisa
-            if self.statistics.get('aich_mismatches', 0) > 0:
-                f.write("WARNING: AICH MISMATCHES DETECTED\n")
-                f.write("-" * 40 + "\n")
-                f.write("Some files have matching ED2K but different AICH hashes.\n")
-                f.write("This could indicate:\n")
-                f.write("  - File corruption\n")
-                f.write("  - Different file versions\n")
-                f.write("  - AICH calculation differences\n\n")
+            # CSV-ONLY STATISTICS (right after OVERVIEW)
+            f.write("CSV-ONLY STATISTICS\n")
+            f.write("-" * 40 + "\n")
 
-            exhibit_matches = defaultdict(int)
-            for match in self.matches:
-                exhibit_matches[match.get('exhibit_csv', '')] += 1
-            if exhibit_matches:
-                f.write("MATCHES BY EXHIBIT\n")
+            # FILE COUNTS
+            f.write("FILE COUNTS\n")
+            f.write("-" * 40 + "\n")
+            f.write(line(f"Total files processed:         {s.get('csv_file_counts_total', 0):,}"))
+            f.write(line(f"Unique files (deduplicated):   {s.get('csv_file_counts_unique', 0):,}"))
+            f.write(line(f"Duplicate instances:           {s.get('csv_file_counts_duplicates', 0):,}"))
+            f.write("\n")
+
+            # PERCENTAGES
+            f.write("PERCENTAGES\n")
+            f.write("-" * 40 + "\n")
+            f.write(line(f"Unique files:                  {s.get('csv_pct_unique', 0.0):.2f}%"))
+            f.write(line(f"Duplicate files:               {s.get('csv_pct_duplicates', 0.0):.2f}%"))
+            f.write("\n")
+
+            # SIZE ANALYSIS
+            f.write("SIZE ANALYSIS\n")
+            f.write("-" * 40 + "\n")
+            tot = s.get('csv_total_size_bytes_all_rows', 0)
+            uni = s.get('csv_total_size_bytes_unique', 0)
+            dup = s.get('csv_duplicate_size_bytes', 0)
+            save_pct = s.get('csv_potential_savings_pct', 0.0)
+            f.write(line(f"Total size (all files):        {bytes_to_mb_gb(tot)}"))
+            f.write(line(f"Unique files size:             {bytes_to_mb_gb(uni)}"))
+            f.write(line(f"Duplicate data size:           {bytes_to_mb_gb(dup)}"))
+            f.write(line(f"Potential storage savings:     {save_pct:.2f}% if deduplicated"))
+            f.write("\n")
+
+            # FILES PER EXHIBIT (CSV rows)
+            per_ex_rows = s.get('csv_files_per_exhibit_rows', {})
+            if per_ex_rows:
+                f.write("FILES PER EXHIBIT (CSV rows)\n")
                 f.write("-" * 40 + "\n")
-                for exhibit, count in sorted(exhibit_matches.items()):
-                    if exhibit:
-                        f.write(f"{exhibit}: {count:,} matches\n")
+                for ex, count in per_ex_rows.items():
+                    f.write(line(f"{ex}: {count:,} files"))
                 f.write("\n")
 
-            known_sources = defaultdict(int)
-            for match in self.matches:
-                known_sources[match.get('source_known', '')] += 1
-            if known_sources:
+            # FILES PER EXHIBIT (CSV unique ED2K — deduplicated within exhibit)
+            per_ex_uni = s.get('csv_files_per_exhibit_unique', {})
+            if per_ex_uni:
+                f.write("FILES PER EXHIBIT (CSV unique ED2K — deduplicated within exhibit)\n")
+                f.write("-" * 40 + "\n")
+                for ex, count in per_ex_uni.items():
+                    f.write(line(f"{ex}: {count:,} files"))
+                f.write("\n")
+
+            # DEDUP INTRA-CSV (per file) with requested column order
+            f.write("DEDUP INTRA-CSV (per file)\n")
+            f.write("-" * 40 + "\n")
+            intra = s.get('intra_csv_stats', [])
+            if intra:
+                f.write(line(f"{'CSV File':40s}  {'Rows':>8s}  {'Unique':>8s}  {'DupRows':>8s}  {'Uniq%':>6s}  {'Dup%':>6s}"))
+                for it in intra:
+                    f.write(line(
+                        f"{it['csv'][:40]:40s}  "
+                        f"{it['rows']:8d}  "
+                        f"{it['unique_ed2k']:8d}  "
+                        f"{it['duplicate_rows']:8d}  "
+                        f"{it['unique_rows_pct']:6.2f}  "
+                        f"{it['duplicate_rows_pct']:6.2f}"
+                    ))
+            f.write("\n")
+
+            # DEDUP INTER-CSV
+            f.write("DEDUP INTER-CSV (global)\n")
+            f.write("-" * 40 + "\n")
+            f.write(line(f"Global duplicate rows:         {s.get('dup_global_rows', 0):,}  ({s.get('pct_dup_global_rows', 0.0):.2f}%)"))
+            f.write(line(f"Unique ED2K present in \u22652 CSV files (cross-file overlap): {s.get('overlap_multi_csv_unique', 0):,}  ({s.get('pct_overlap_multi_csv_unique', 0.0):.2f}%)"))
+            f.write("\n")
+
+            # MATCH PERCENTAGES
+            f.write("MATCHES (percentages)\n")
+            f.write("-" * 40 + "\n")
+            f.write(line(f"Matched rows:                  {s.get('matched_rows', 0):,}  ({s.get('pct_rows_matched', 0.0):.2f}%)"))
+            f.write(line(f"Unmatched rows:                {s.get('unmatched_rows', 0):,}  ({s.get('pct_rows_unmatched', 0.0):.2f}%)"))
+            f.write(line(f"Matched unique ED2K:           {s.get('matched_unique', 0):,}  ({s.get('pct_unique_matched', 0.0):.2f}%)"))
+            f.write(line(f"Unmatched unique ED2K:         {s.get('unmatched_unique', 0):,}  ({s.get('pct_unique_unmatched', 0.0):.2f}%)"))
+            f.write("\n")
+
+            # BYTES UPLOADED
+            f.write("BYTES UPLOADED (on matches)\n")
+            f.write("-" * 40 + "\n")
+            raw_b = s.get('bytes_uploaded_total_matches', 0)
+            uniq_b = s.get('bytes_uploaded_total_unique', 0)
+            f.write(line(f"Total (raw matches):           {raw_b:,} bytes  ({fmt_bytes(raw_b)})"))
+            f.write(line(f"Total (unique ED2K):           {uniq_b:,} bytes  ({fmt_bytes(uniq_b)})"))
+            f.write("\n")
+
+            # TEMPORAL BREAKDOWN (counts)
+            f.write("TEMPORAL BREAKDOWN (unique ED2K) – COUNTS\n")
+            f.write("-" * 40 + "\n")
+            f.write("last_shared by YEAR\n")
+            f.write(fmt_map_count(s.get('last_shared_by_year_count', {}), "Year"))
+            f.write("\nlast_shared by YEAR-MONTH\n")
+            f.write(fmt_map_count(s.get('last_shared_by_month_count', {}), "Year-Month"))
+            f.write("\nlast_posted by YEAR\n")
+            f.write(fmt_map_count(s.get('last_posted_by_year_count', {}), "Year"))
+            f.write("\nlast_posted by YEAR-MONTH\n")
+            f.write(fmt_map_count(s.get('last_posted_by_month_count', {}), "Year-Month"))
+            f.write("\n")
+
+            # TEMPORAL BREAKDOWN (bytes)
+            f.write("TEMPORAL BREAKDOWN (unique ED2K) – BYTES UPLOADED\n")
+            f.write("-" * 40 + "\n")
+            f.write("last_shared by YEAR (bytes)\n")
+            f.write(fmt_map_bytes(s.get('last_shared_by_year_bytes', {}), "Year"))
+            f.write("\nlast_shared by YEAR-MONTH (bytes)\n")
+            f.write(fmt_map_bytes(s.get('last_shared_by_month_bytes', {}), "Year-Month"))
+            f.write("\nlast_posted by YEAR (bytes)\n")
+            f.write(fmt_map_bytes(s.get('last_posted_by_year_bytes', {}), "Year"))
+            f.write("\nlast_posted by YEAR-MONTH (bytes)\n")
+            f.write(fmt_map_bytes(s.get('last_posted_by_month_bytes', {}), "Year-Month"))
+            f.write("\n")
+
+            # MATCHED BY EXHIBIT
+            per_ex = s.get('per_exhibit_counts', {})
+            if per_ex:
+                f.write("MATCHED BY EXHIBIT\n")
+                f.write("-" * 40 + "\n")
+                for exhibit, count in per_ex.items():
+                    f.write(line(f"{exhibit}: {count:,}"))
+                f.write("\n")
+
+            # MATCHES BY KNOWN.MET SOURCE
+            per_src = s.get('per_known_source', {})
+            if per_src:
                 f.write("MATCHES BY KNOWN.MET SOURCE\n")
                 f.write("-" * 40 + "\n")
-                for source, count in sorted(known_sources.items()):
-                    if source:
-                        f.write(f"{source}: {count:,} matches\n")
+                for src, count in per_src.items():
+                    f.write(line(f"{src}: {count:,}"))
                 f.write("\n")
 
-            if 'most_common_files' in self.statistics:
+            # TOP 10 with full hashes
+            top10 = s.get('top10', [])
+            if top10:
                 f.write("TOP 10 MOST COMMON MATCHED FILES\n")
                 f.write("-" * 40 + "\n")
-                for i, info in enumerate(self.statistics['most_common_files'], 1):
-                    f.write(f"{i}. {info['filename']}\n")
-                    f.write(f"   Hash: {info['hash'][:16]}...\n")
-                    f.write(f"   Occurrences: {info['count']}\n")
+                for i, info in enumerate(top10, 1):
+                    f.write(line(f"{i}. {info['filename']}"))
+                    f.write(line(f"   Hash: {info['hash']}"))
+                    f.write(line(f"   Occurrences: {info['count']}"))
                 f.write("\n")
 
-            f.write("SUMMARY\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"Analysis complete. {self.statistics.get('matched_files', 0)} files from forensic ")
-            f.write(f"analysis were found in eMule known.met files.\n")
-            mp = self.statistics.get('match_percentage', 0)
-            if mp > 50:
-                f.write("HIGH MATCH RATE: Significant overlap with eMule known files.\n")
-            elif mp > 20:
-                f.write("MODERATE MATCH RATE: Some files present in eMule known files.\n")
-            else:
-                f.write("LOW MATCH RATE: Few files found in eMule known files.\n")
-            f.write("\n" + "=" * 80 + "\n")
-            f.write("END OF REPORT\n")
             f.write("=" * 80 + "\n")
-        print(f"Exported statistics: {stats_file}")
+            f.write("END OF SUMMARY\n")
+            f.write("=" * 80 + "\n")
 
+        print(f"Exported summary: {stats_file}")
 
-# ----------------------------------------------------------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------------------------------------------------------
+# ----------------------------------- CLI -----------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Known.met Analyzer (AICH-fixed) - Match ForEmHash outputs with eMule known.met/known2.met files',
+        description='Known.met Analyzer (dedup intra/inter CSV, percentages, AICH-free summary, full hashes in Top 10)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
@@ -635,10 +916,10 @@ Examples:
   %(prog)s --csv-dir ./forensics/csv --known-dir ./evidence/emule -o ./results --verbose
         '''
     )
-    parser.add_argument('-c', '--csv-dir', required=True, help='Directory contenente i CSV di ForEmHash')
-    parser.add_argument('-k', '--known-dir', required=True, help='Directory con known.met / known2.met')
-    parser.add_argument('-o', '--output', required=True, help='Directory di output')
-    parser.add_argument('--verbose', action='store_true', help='Output verboso')
+    parser.add_argument('-c', '--csv-dir', required=True, help='Directory containing ForEmHash CSV files')
+    parser.add_argument('-k', '--known-dir', required=True, help='Directory containing known.met / known2.met')
+    parser.add_argument('-o', '--output', required=True, help='Output directory')
+    parser.add_argument('--verbose', action='store_true', help='Verbose parsing logs')
 
     args = parser.parse_args()
 
@@ -651,7 +932,7 @@ Examples:
     os.makedirs(args.output, exist_ok=True)
 
     print("=" * 80)
-    print("KNOWN.MET ANALYZER FOR FOREMHASH (AICH-FIXED)")
+    print("KNOWN.MET ANALYZER (DEDUP + PERCENTAGES, AICH-FREE SUMMARY)")
     print("=" * 80)
     print(f"CSV Directory:    {args.csv_dir}")
     print(f"Known Directory:  {args.known_dir}")
@@ -662,22 +943,21 @@ Examples:
 
     print("Step 1: Loading ForEmHash CSV files...")
     csv_count = analyzer.load_csv_files(args.csv_dir)
-    print(f"  Loaded {csv_count} file records from CSV files\n")
+    print(f"  Loaded {csv_count} CSV rows\n")
     if csv_count == 0:
         print("Error: No CSV data loaded")
         sys.exit(1)
 
     print("Step 2: Loading known.met files...")
     known_count = analyzer.load_known_met_files(args.known_dir, verbose=args.verbose)
-    print(f"  Loaded {known_count} file records from known.met files\n")
+    print(f"  Loaded {known_count} known.met rows\n")
     if known_count == 0:
         print("Warning: No known.met data loaded")
 
     print("Step 3: Analyzing matches...")
     analyzer.analyze_matches()
-    print(f"  Found {analyzer.statistics.get('matched_files', 0)} matches")
-    print(f"  AICH matches: {analyzer.statistics.get('aich_matches', 0)}")
-    print(f"  AICH mismatches: {analyzer.statistics.get('aich_mismatches', 0)}\n")
+    print(f"  Matched rows: {analyzer.statistics.get('matched_rows', 0)} "
+          f"({analyzer.statistics.get('pct_rows_matched', 0.0):.2f}%)\n")
 
     print("Step 4: Exporting results...")
     analyzer.export_results(args.output)
@@ -685,13 +965,13 @@ Examples:
     print("\n" + "=" * 80)
     print("ANALYSIS COMPLETE")
     print("=" * 80)
-    print(f"Total CSV files:        {analyzer.statistics.get('total_csv_files', 0):,}")
-    print(f"Total known.met files:  {analyzer.statistics.get('total_known_files', 0):,}")
-    print(f"Matched files:          {analyzer.statistics.get('matched_files', 0):,}")
-    print(f"Match percentage:       {analyzer.statistics.get('match_percentage', 0):.2f}%")
-    print(f"Unique matches:         {analyzer.statistics.get('unique_matched_hashes', 0):,}")
-    print(f"AICH status:            {analyzer.statistics.get('aich_matches', 0)} matches, "
-          f"{analyzer.statistics.get('aich_mismatches', 0)} mismatches")
+    print(f"Total CSV rows:          {analyzer.statistics.get('total_csv_rows', 0):,}")
+    print(f"CSV unique ED2K:         {analyzer.statistics.get('total_csv_unique', 0):,}")
+    print(f"Matched rows:            {analyzer.statistics.get('matched_rows', 0):,} "
+          f"({analyzer.statistics.get('pct_rows_matched', 0.0):.2f}%)")
+    print(f"Matched unique ED2K:     {analyzer.statistics.get('matched_unique', 0):,} "
+          f"({analyzer.statistics.get('pct_unique_matched', 0.0):.2f}%)")
+    print(f"Bytes uploaded (unique): {fmt_bytes(analyzer.statistics.get('bytes_uploaded_total_unique', 0))}")
     print("\nResults saved to: " + args.output)
     print("=" * 80)
 
