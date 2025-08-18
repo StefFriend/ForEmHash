@@ -19,7 +19,6 @@ ForEmHash is a forensic tool designed to calculate eMule/ED2K hashes for digital
   
 - **Forensic-Ready**
   - Custom exhibit naming for case management
-  - SHA1 hash calculation
   - CSV export with timestamp
   - Chain of custody documentation
   - Batch processing capabilities
@@ -123,7 +122,6 @@ ForEmHash generates CSV files with the following structure:
 | size_bytes | File size in bytes |
 | size_mb | File size in megabytes |
 | ed2k_hash | ED2K hash (main eMule identifier) |
-| sha1_hash | SHA1 hash (for compatibility) |
 | aich_hash | AICH root hash |
 | num_chunks | Number of 9.28MB chunks |
 | chunk_X_hash | Individual chunk hashes (if applicable) |
@@ -132,8 +130,8 @@ ForEmHash generates CSV files with the following structure:
 ### Example Output
 
 ```csv
-exhibit,filename,filepath,size_bytes,size_mb,ed2k_hash,sha1_hash,aich_hash,num_chunks,status
-CASE001_HD1,document.pdf,/evidence/document.pdf,5242880,5.0,A1B2C3D4...,DF29831...,E5F6G7H8...,1,Success
+exhibit,filename,filepath,size_bytes,size_mb,ed2k_hash,aich_hash,num_chunks,status
+CASE001_HD1,document.pdf,/evidence/document.pdf,5242880,5.0,A1B2C3D4...,E5F6G7H8...,1,Success
 ```
 
 ## 🔄 CSV Merger Tool (foremhash_merger.py)
@@ -172,7 +170,7 @@ The merger generates three files with automatic timestamps:
    - Empty cells for missing chunk columns
 
 2. **unique_files_[timestamp].csv**
-   - Deduplicated file list (one entry per unique ED2K hash or SHA1 hash)
+   - Deduplicated file list (one entry per unique ED2K hash)
    - If a file appears 10 times across exhibits, it's listed once
    - Essential for identifying unique evidence
 
@@ -245,7 +243,7 @@ python foremhash_merger.py ./reports/*.csv -o ./final_analysis
 
 ### Deduplication Logic
 
-Files are considered identical if they share the same ED2K hash or the same SHA1 hash (in case of missing ED2K hash in input csv), regardless of:
+Files are considered identical if they share the same ED2K hash, regardless of:
 - File name
 - File path
 - Exhibit location
