@@ -1,7 +1,3 @@
-Here’s an updated **README.md** with a new section describing **forknown.py**. I kept the existing content as-is and added the new analyzer right after the CSV Merger tool section, plus a quick reference in “Usage”.
-
----
-
 # ForEmHash - Forensic eMule Hash Calculator
 
 [![Python](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
